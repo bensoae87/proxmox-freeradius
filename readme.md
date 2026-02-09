@@ -6,4 +6,4 @@ FreeRADIUS 4 with a default test user.
 ## Usage
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/andrewbenson/proxmox-freeradius/main/freeradius-lxc.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/bensoae87/proxmox-freeradius/main/freeradius-lxc.sh)"
