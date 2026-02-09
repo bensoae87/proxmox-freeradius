@@ -1,8 +1,13 @@
-
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 echo "=== Proxmox FreeRADIUS LXC Setup (Debian 12 Bookworm) ==="
+
+# ---- Safety Check ----
+if ! command -v pct >/dev/null; then
+  echo "❌ This script must be run on a Proxmox host"
+  exit 1
+fi
 
 # ---- Defaults ----
 DEFAULT_CORES=2
@@ -12,6 +17,10 @@ DEFAULT_HOSTNAME="freeradius"
 DEFAULT_NET="dhcp"
 DEFAULT_BRIDGE="vmbr0"
 DEFAULT_CTID=$(pvesh get /cluster/nextid)
+
+# ---- Confirmation ----
+read -rp "This will create a new LXC container. Continue? [y/N]: " CONFIRM
+[[ "$CONFIRM" =~ ^[Yy]$ ]] || exit 1
 
 # ---- Prompts ----
 read -rp "Container ID [$DEFAULT_CTID]: " CTID
@@ -42,29 +51,47 @@ else
   NETCONF="name=eth0,bridge=$BRIDGE,ip=dhcp"
 fi
 
-# ---- Debian template ----
-TEMPLATE="debian-12-standard_12.2-1_amd64.tar.zst"
-TEMPLATE_PATH="/var/lib/vz/template/cache/$TEMPLATE"
+# ---- Detect Storage Supporting Templates ----
+echo "Detecting storage that supports LXC templates..."
+STORAGE=$(pvesm status -t dir | awk 'NR>1 {print $1}' | head -n 1)
 
-if [[ ! -f "$TEMPLATE_PATH" ]]; then
-  echo "Downloading Debian 12 template..."
-  pveam update
-  pveam download local "$TEMPLATE"
+if [[ -z "$STORAGE" ]]; then
+  echo "❌ No storage found that supports LXC templates (dir)"
+  exit 1
 fi
+
+echo "Using storage: $STORAGE"
+
+# ---- Find Latest Debian 12 Template ----
+echo "Looking up latest Debian 12 template..."
+pveam update
+
+TEMPLATE=$(pveam available --section system \
+  | awk '/debian-12-standard/ {print $2}' \
+  | sort -V \
+  | tail -n 1)
+
+if [[ -z "$TEMPLATE" ]]; then
+  echo "❌ Could not find Debian 12 template"
+  exit 1
+fi
+
+echo "Using template: $TEMPLATE"
+pveam download "$STORAGE" "$TEMPLATE"
 
 # ---- Create LXC ----
 echo "Creating container $CTID..."
-pct create "$CTID" "$TEMPLATE_PATH" \
+pct create "$CTID" "$STORAGE:vztmpl/$TEMPLATE" \
   --hostname "$HOSTNAME" \
   --cores "$CORES" \
   --memory "$RAM" \
-  --rootfs local-lvm:${DISK} \
+  --rootfs ${STORAGE}:${DISK} \
   --net0 "$NETCONF" \
   --features keyctl=1,nesting=1 \
   --unprivileged 1 \
   --onboot 1
 
-# ---- Start container ----
+# ---- Start Container ----
 pct start "$CTID"
 echo "Waiting for container to boot..."
 sleep 8
@@ -78,7 +105,7 @@ apt -y upgrade
 apt -y install freeradius freeradius-utils
 "
 
-# ---- Configure test user ----
+# ---- Configure Default RADIUS User ----
 echo "Configuring default RADIUS user (radusr / radusr)..."
 pct exec "$CTID" -- bash -c "
 cat <<EOF >> /etc/freeradius/4.0/mods-config/files/authorize
@@ -86,21 +113,19 @@ radusr Cleartext-Password := \"radusr\"
 EOF
 "
 
-# ---- Enable & restart ----
+# ---- Enable & Restart ----
 pct exec "$CTID" -- bash -c "
 systemctl enable freeradius
 systemctl restart freeradius
-systemctl status freeradius --no-pager
 "
 
-# ---- Final info ----
+# ---- Final Output ----
 echo
 echo "=== Setup Complete ==="
-echo "Container ID: $CTID"
-echo "Hostname: $HOSTNAME"
-echo "RADIUS test user:"
-echo "  Username: radusr"
-echo "  Password: radusr"
+echo "Container ID : $CTID"
+echo "Hostname     : $HOSTNAME"
+echo "RADIUS User  : radusr"
+echo "Password     : radusr"
 echo
-echo "To test:"
+echo "Test with:"
 echo "  pct exec $CTID -- radtest radusr radusr localhost 0 testing123"
