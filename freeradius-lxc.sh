@@ -51,20 +51,14 @@ else
   NETCONF="name=eth0,bridge=$BRIDGE,ip=dhcp"
 fi
 
-# ---- Detect Valid Template Storage ----
+# ---- Detect Storage That Actually Supports Templates ----
 echo "Detecting active storage that supports LXC templates (vztmpl)..."
 
-STORAGE=""
-while read -r name type status content _; do
-  [[ "$status" != "active" ]] && continue
-  [[ "$content" != *vztmpl* ]] && continue
-  STORAGE="$name"
-  break
-done < <(pvesm status)
+STORAGE=$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 {print $1}' | head -n 1)
 
 if [[ -z "$STORAGE" ]]; then
   echo "❌ No active storage found that supports LXC templates (vztmpl)"
-  echo "Run: pvesm status"
+  echo "Check with: pvesm status"
   exit 1
 fi
 
@@ -84,4 +78,56 @@ if [[ -z "$TEMPLATE" ]]; then
   exit 1
 fi
 
-echo "Using templat
+echo "Using template: $TEMPLATE"
+pveam download "$STORAGE" "$TEMPLATE"
+
+# ---- Create LXC ----
+echo "Creating container $CTID..."
+pct create "$CTID" "$STORAGE:vztmpl/$TEMPLATE" \
+  --hostname "$HOSTNAME" \
+  --cores "$CORES" \
+  --memory "$RAM" \
+  --rootfs ${STORAGE}:${DISK} \
+  --net0 "$NETCONF" \
+  --features keyctl=1,nesting=1 \
+  --unprivileged 1 \
+  --onboot 1
+
+# ---- Start Container ----
+pct start "$CTID"
+echo "Waiting for container to boot..."
+sleep 8
+
+# ---- Install FreeRADIUS ----
+echo "Installing FreeRADIUS 4..."
+pct exec "$CTID" -- bash -c "
+set -e
+apt update
+apt -y upgrade
+apt -y install freeradius freeradius-utils
+"
+
+# ---- Configure Default RADIUS User ----
+echo "Configuring default RADIUS user (radusr / radusr)..."
+pct exec "$CTID" -- bash -c "
+cat <<EOF >> /etc/freeradius/4.0/mods-config/files/authorize
+radusr Cleartext-Password := \"radusr\"
+EOF
+"
+
+# ---- Enable & Restart ----
+pct exec "$CTID" -- bash -c "
+systemctl enable freeradius
+systemctl restart freeradius
+"
+
+# ---- Final Output ----
+echo
+echo "=== Setup Complete ==="
+echo "Container ID : $CTID"
+echo "Hostname     : $HOSTNAME"
+echo "RADIUS User  : radusr"
+echo "Password     : radusr"
+echo
+echo "Test with:"
+echo "  pct exec $CTID -- radtest radusr radusr localhost 0 testing123"
