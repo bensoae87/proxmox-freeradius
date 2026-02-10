@@ -68,8 +68,16 @@ chown -R www-data:www-data daloradius
 
 msg_info "Importing daloRADIUS schema"
 pct exec $CTID -- bash -c "
-mysql radius < /var/www/html/daloradius/contrib/db/mysql-daloradius.sql
+SCHEMA='/var/www/html/daloradius/app/common/sql/mysql-daloradius.sql'
+
+if [ ! -f \"\$SCHEMA\" ]; then
+  echo 'daloRADIUS schema not found'
+  exit 1
+fi
+
+mysql radius < \"\$SCHEMA\"
 "
+
 
 msg_info "Configuring daloRADIUS"
 pct exec $CTID -- bash -c "
