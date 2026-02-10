@@ -9,6 +9,13 @@ if ! command -v pct >/dev/null; then
   exit 1
 fi
 
+# ---- Ensure jq is available (Proxmox 8 may not ship it) ----
+if ! command -v jq >/dev/null; then
+  echo "jq not found — installing..."
+  apt update
+  apt install -y jq
+fi
+
 # ---- Defaults ----
 DEFAULT_CORES=2
 DEFAULT_RAM=2048
@@ -51,7 +58,7 @@ else
   NETCONF="name=eth0,bridge=$BRIDGE,ip=dhcp"
 fi
 
-# ---- Detect Active Template-Capable Storage (Proxmox 8 Safe) ----
+# ---- Detect Active Storage Supporting LXC Templates ----
 echo "Detecting active storage that supports LXC templates (vztmpl)..."
 
 STORAGE=$(pvesh get /storage --output-format json \
@@ -129,7 +136,7 @@ echo "=== Setup Complete ==="
 echo "Container ID : $CTID"
 echo "Hostname     : $HOSTNAME"
 echo "RADIUS User  : radusr"
-echo "Password     : radusr"
+echo "Password    : radusr"
 echo
 echo "Test with:"
 echo "  pct exec $CTID -- radtest radusr radusr localhost 0 testing123"
