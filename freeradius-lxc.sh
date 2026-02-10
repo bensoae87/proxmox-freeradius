@@ -5,8 +5,12 @@
 
 set -e
 
+# Load Proxmox community build framework
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 
+# -----------------------------------------------------------------------------
+# App Metadata / Defaults
+# -----------------------------------------------------------------------------
 APP="FreeRADIUS + daloRADIUS"
 var_tags="radius;daloradius"
 var_cpu="2"
@@ -14,13 +18,19 @@ var_ram="2048"
 var_disk="8"
 var_os="debian"
 var_version="12"
-var_unprivileged="0"
-var_hostname="freeradius"
+var_unprivileged="0"          # REQUIRED for FreeRADIUS
+var_hostname="freeradius"     # ✅ DEFAULT HOSTNAME
 
+# -----------------------------------------------------------------------------
+# Build the container
+# -----------------------------------------------------------------------------
 start
 build_container
 
-msg_info "Installing packages"
+# -----------------------------------------------------------------------------
+# Install base packages
+# -----------------------------------------------------------------------------
+msg_info "Installing FreeRADIUS, MariaDB, Apache, PHP"
 
 pct exec "$CTID" -- bash -c "
 export DEBIAN_FRONTEND=noninteractive
@@ -32,6 +42,9 @@ apt -y install freeradius freeradius-utils mariadb-server \
                php-mbstring php-xml git unzip
 "
 
+# -----------------------------------------------------------------------------
+# Systemd overrides for LXC compatibility
+# -----------------------------------------------------------------------------
 msg_info "Applying systemd overrides for LXC compatibility"
 
 pct exec "$CTID" -- bash -c "
@@ -53,6 +66,9 @@ systemctl daemon-reexec
 systemctl daemon-reload
 "
 
+# -----------------------------------------------------------------------------
+# Start services
+# -----------------------------------------------------------------------------
 msg_info "Starting services"
 
 pct exec "$CTID" -- bash -c "
@@ -60,7 +76,10 @@ systemctl enable mariadb apache2 freeradius
 systemctl start mariadb apache2 freeradius
 "
 
-msg_info "Configuring FreeRADIUS user"
+# -----------------------------------------------------------------------------
+# Configure FreeRADIUS test user
+# -----------------------------------------------------------------------------
+msg_info "Configuring FreeRADIUS test user"
 
 pct exec "$CTID" -- bash -c "
 cat <<EOF >> /etc/freeradius/3.0/mods-config/files/authorize
@@ -70,7 +89,10 @@ EOF
 systemctl restart freeradius
 "
 
-msg_info "Configuring MariaDB and daloRADIUS"
+# -----------------------------------------------------------------------------
+# Configure MariaDB and daloRADIUS
+# -----------------------------------------------------------------------------
+msg_info "Installing and configuring daloRADIUS"
 
 pct exec "$CTID" -- bash -c "
 mysql -e \"CREATE DATABASE IF NOT EXISTS radius;\"
@@ -94,7 +116,10 @@ sed -i \"s/DB_NAME.*/DB_NAME = 'radius';/\" daloradius/library/daloradius.conf.p
 systemctl restart apache2
 "
 
-msg_ok "Installation complete"
+# -----------------------------------------------------------------------------
+# Final Output
+# -----------------------------------------------------------------------------
+msg_ok "FreeRADIUS + daloRADIUS installation complete"
 
 IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}')
 
@@ -102,6 +127,7 @@ echo
 echo "------------------------------------------------------------"
 echo " FreeRADIUS + daloRADIUS READY"
 echo "------------------------------------------------------------"
+echo " Hostname     : freeradius"
 echo " Container ID : $CTID"
 echo " IP Address   : $IP"
 echo
@@ -110,6 +136,6 @@ echo "   radtest radusr radusr $IP 0 testing123"
 echo
 echo " daloRADIUS UI:"
 echo "   http://$IP/daloradius"
-echo "   User: administrator"
-echo "   Pass: radius"
+echo "   Username: administrator"
+echo "   Password: radius"
 echo "------------------------------------------------------------"
