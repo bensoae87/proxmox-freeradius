@@ -1,133 +1,127 @@
 #!/usr/bin/env bash
-# -----------------------------------------------------------------------------
-# FreeRADIUS + daloRADIUS Installer (Proxmox LXC Safe)
-# -----------------------------------------------------------------------------
-
-set -e
-
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 
 APP="FreeRADIUS + daloRADIUS"
-var_tags="radius;daloradius"
+var_tags="radius,freeradius,daloradius,auth"
 var_cpu="2"
 var_ram="2048"
 var_disk="8"
 var_os="debian"
 var_version="12"
 var_unprivileged="0"
+var_dhcp="1"
 var_hostname="freeradius"
 
+header_info
+echo "This will install FreeRADIUS with daloRADIUS (SQL-only auth)."
+echo ""
+
+DB_PASS="$(whiptail --passwordbox "Enter MariaDB password for FreeRADIUS/daloRADIUS" 10 60 3>&1 1>&2 2>&3)"
+if [ -z "$DB_PASS" ]; then
+  msg_error "Database password cannot be empty"
+  exit 1
+fi
+
+variables
+color
+catch_errors
 start
 build_container
 
-# -----------------------------------------------------------------------------
-# Install packages
-# -----------------------------------------------------------------------------
-msg_info "Installing FreeRADIUS, MariaDB, Apache, PHP"
-
-pct exec "$CTID" -- bash -c "
-export DEBIAN_FRONTEND=noninteractive
-apt update
-apt -y upgrade
-apt -y install freeradius freeradius-utils mariadb-server \
-               apache2 php php-mysql php-gd php-curl php-zip \
-               php-mbstring php-xml git unzip
+msg_info "Setting root and radusr passwords"
+pct exec $CTID -- bash -c "
+echo root:radusr | chpasswd &&
+useradd -m -s /bin/bash radusr &&
+echo radusr:radusr | chpasswd &&
+usermod -aG sudo radusr
 "
 
-# -----------------------------------------------------------------------------
-# Systemd overrides for LXC compatibility
-# -----------------------------------------------------------------------------
-msg_info "Applying systemd overrides for LXC compatibility"
-
-pct exec "$CTID" -- bash -c "
-for svc in freeradius mariadb apache2; do
-  mkdir -p /etc/systemd/system/\$svc.service.d
-  cat <<EOF > /etc/systemd/system/\$svc.service.d/override.conf
-[Service]
-PrivateTmp=no
-ProtectSystem=off
-ProtectHome=off
-NoNewPrivileges=no
-RestrictNamespaces=no
-EOF
-done
-
-systemctl daemon-reexec
-systemctl daemon-reload
+msg_info "Installing packages"
+pct exec $CTID -- bash -c "
+apt update &&
+apt install -y freeradius freeradius-mysql mariadb-server apache2 \
+php php-mysql php-gd php-xml php-mbstring php-curl git unzip
 "
 
-# -----------------------------------------------------------------------------
-# Start services
-# -----------------------------------------------------------------------------
-msg_info "Starting services"
-
-pct exec "$CTID" -- bash -c "
-systemctl enable mariadb apache2 freeradius
-systemctl start mariadb apache2 freeradius
+msg_info "Configuring MariaDB"
+pct exec $CTID -- bash -c "
+systemctl enable --now mariadb &&
+mysql -e \"
+CREATE DATABASE radius;
+CREATE USER 'radius'@'localhost' IDENTIFIED BY '$DB_PASS';
+GRANT ALL PRIVILEGES ON radius.* TO 'radius'@'localhost';
+FLUSH PRIVILEGES;
+\"
 "
 
-# -----------------------------------------------------------------------------
-# Configure FreeRADIUS test user
-# -----------------------------------------------------------------------------
-msg_info "Configuring FreeRADIUS test user"
-
-pct exec "$CTID" -- bash -c "
-cat <<EOF >> /etc/freeradius/3.0/mods-config/files/authorize
-radusr Cleartext-Password := \"radusr\"
-EOF
-
-systemctl restart freeradius
+msg_info "Importing schemas"
+pct exec $CTID -- bash -c "
+mysql radius < /etc/freeradius/3.0/mods-config/sql/main/mysql/schema.sql
 "
 
-# -----------------------------------------------------------------------------
-# Configure MariaDB + daloRADIUS (FIXED PATHS)
-# -----------------------------------------------------------------------------
-msg_info "Installing and configuring daloRADIUS"
-
-pct exec "$CTID" -- bash -c "
-mysql -e \"CREATE DATABASE IF NOT EXISTS radius;\"
-mysql -e \"CREATE USER IF NOT EXISTS 'radius'@'localhost' IDENTIFIED BY 'radius';\"
-mysql -e \"GRANT ALL PRIVILEGES ON radius.* TO 'radius'@'localhost';\"
-mysql -e \"FLUSH PRIVILEGES;\"
-
-cd /var/www/html
-git clone https://github.com/lirantal/daloradius.git || true
+msg_info "Installing daloRADIUS"
+pct exec $CTID -- bash -c "
+cd /var/www/html &&
+git clone https://github.com/lirantal/daloradius.git &&
 chown -R www-data:www-data daloradius
-
-# Import schema
-mysql radius < daloradius/contrib/db/fr2-mysql-daloradius-and-freeradius.sql
-
-# Configure daloRADIUS (NEW LAYOUT)
-cd daloradius/app/config
-cp conf.php.sample conf.php
-
-sed -i \"s/'DB_USER'.*/'DB_USER' => 'radius',/\" conf.php
-sed -i \"s/'DB_PASS'.*/'DB_PASS' => 'radius',/\" conf.php
-sed -i \"s/'DB_NAME'.*/'DB_NAME' => 'radius',/\" conf.php
-
-systemctl restart apache2
 "
 
-# -----------------------------------------------------------------------------
-# Final Output
-# -----------------------------------------------------------------------------
-msg_ok "FreeRADIUS + daloRADIUS installation complete"
+msg_info "Importing daloRADIUS schema"
+pct exec $CTID -- bash -c "
+mysql radius < /var/www/html/daloradius/contrib/db/mysql-daloradius.sql
+"
 
-IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}')
+msg_info "Configuring daloRADIUS"
+pct exec $CTID -- bash -c "
+cp /var/www/html/daloradius/app/common/includes/daloradius.conf.php.sample \
+   /var/www/html/daloradius/app/common/includes/daloradius.conf.php &&
+sed -i \"
+s/'DB_USER'.*/'DB_USER' => 'radius',/
+s/'DB_PASSWORD'.*/'DB_PASSWORD' => '$DB_PASS',/
+s/'DB_NAME'.*/'DB_NAME' => 'radius',/
+s/'DB_HOST'.*/'DB_HOST' => 'localhost',/
+\" /var/www/html/daloradius/app/common/includes/daloradius.conf.php
+"
 
-echo
-echo "------------------------------------------------------------"
-echo " FreeRADIUS + daloRADIUS READY"
-echo "------------------------------------------------------------"
-echo " Hostname     : freeradius"
-echo " Container ID : $CTID"
-echo " IP Address   : $IP"
-echo
-echo " RADIUS Test:"
-echo "   radtest radusr radusr $IP 0 testing123"
-echo
-echo " daloRADIUS UI:"
-echo "   http://$IP/daloradius"
-echo "   Username: administrator"
-echo "   Password: radius"
-echo "------------------------------------------------------------"
+msg_info "Configuring FreeRADIUS SQL-only auth"
+pct exec $CTID -- bash -c "
+ln -s /etc/freeradius/3.0/mods-available/sql /etc/freeradius/3.0/mods-enabled/sql &&
+rm -f /etc/freeradius/3.0/mods-enabled/files &&
+sed -i \"
+s/login = .*/login = \\\"radius\\\"/
+s/password = .*/password = \\\"$DB_PASS\\\"/
+s/radius_db = .*/radius_db = \\\"radius\\\"/
+\" /etc/freeradius/3.0/mods-available/sql
+"
+
+msg_info "Adding test RADIUS client and user"
+pct exec $CTID -- bash -c "
+echo '
+client testclient {
+  ipaddr = 127.0.0.1
+  secret = testing123
+}
+' >> /etc/freeradius/3.0/clients.conf &&
+
+mysql radius -e \"
+INSERT INTO radcheck (username, attribute, op, value)
+VALUES ('testuser','Cleartext-Password',':=','testpass');
+\"
+"
+
+msg_info "Starting services"
+pct exec $CTID -- bash -c "
+systemctl enable --now freeradius apache2
+"
+
+msg_ok "Installation complete!"
+
+echo ""
+echo "daloRADIUS:"
+echo "  http://<container-ip>/daloradius"
+echo "  admin / radius"
+echo ""
+echo "Test RADIUS user:"
+echo "  testuser / testpass"
+echo "  client secret: testing123"
+echo ""
