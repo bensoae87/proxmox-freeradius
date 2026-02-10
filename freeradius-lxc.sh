@@ -1,107 +1,69 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
-# FreeRADIUS + daloRADIUS LXC Installer (Proxmox Community Style)
+# FreeRADIUS LXC Installer for Proxmox
+# Uses the official Proxmox community-scripts build framework
 # -----------------------------------------------------------------------------
 
 set -e
 
-# Load Proxmox community build framework
+# Load community build functions (same as tasmoadmin.sh)
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 
 # -----------------------------------------------------------------------------
-# App Metadata
+# App Metadata (used by the framework)
 # -----------------------------------------------------------------------------
-APP="FreeRADIUS + daloRADIUS"
-var_tags="radius;daloradius;auth"
+APP="FreeRADIUS"
+var_tags="radius;auth"
 var_cpu="2"
 var_ram="2048"
 var_disk="8"
 var_os="debian"
 var_version="12"
-var_unprivileged="0"     # REQUIRED for FreeRADIUS
+var_unprivileged="1"
 var_hostname="freeradius"
 
 # -----------------------------------------------------------------------------
-# Build the container
+# Create the container
 # -----------------------------------------------------------------------------
 start
 build_container
 
 # -----------------------------------------------------------------------------
-# Install FreeRADIUS + daloRADIUS
+# Post-install configuration inside the container
 # -----------------------------------------------------------------------------
-msg_info "Installing FreeRADIUS and daloRADIUS"
+msg_info "Installing FreeRADIUS 4"
 
 pct exec "$CTID" -- bash -c "
 set -e
 
-export DEBIAN_FRONTEND=noninteractive
-
 apt update
 apt -y upgrade
+apt -y install freeradius freeradius-utils
 
-# Base packages
-apt -y install freeradius freeradius-utils mariadb-server \
-               apache2 php php-mysql php-gd php-curl php-zip \
-               php-mbstring php-xml git unzip
-
-# Enable services
-systemctl enable mariadb apache2 freeradius
-systemctl start mariadb apache2
-
-# FreeRADIUS test user
-cat <<EOF >> /etc/freeradius/3.0/mods-config/files/authorize
+echo 'Adding default RADIUS user: radusr / radusr'
+cat <<EOF >> /etc/freeradius/4.0/mods-config/files/authorize
 radusr Cleartext-Password := \"radusr\"
 EOF
 
-# Restart FreeRADIUS
+systemctl enable freeradius
 systemctl restart freeradius
-
-# Secure MariaDB (minimal)
-mysql -e \"CREATE DATABASE radius;\"
-mysql -e \"CREATE USER 'radius'@'localhost' IDENTIFIED BY 'radius';\"
-mysql -e \"GRANT ALL PRIVILEGES ON radius.* TO 'radius'@'localhost';\"
-mysql -e \"FLUSH PRIVILEGES;\"
-
-# Install daloRADIUS
-cd /var/www/html
-git clone https://github.com/lirantal/daloradius.git
-chown -R www-data:www-data daloradius
-
-# Import daloRADIUS schema
-mysql radius < daloradius/contrib/db/fr2-mysql-daloradius-and-freeradius.sql
-
-# Configure daloRADIUS
-cp daloradius/library/daloradius.conf.php.sample \
-   daloradius/library/daloradius.conf.php
-
-sed -i \"s/DB_USER.*/DB_USER = 'radius';/\" daloradius/library/daloradius.conf.php
-sed -i \"s/DB_PASSWORD.*/DB_PASSWORD = 'radius';/\" daloradius/library/daloradius.conf.php
-sed -i \"s/DB_NAME.*/DB_NAME = 'radius';/\" daloradius/library/daloradius.conf.php
-
-systemctl restart apache2
 "
 
-msg_ok "FreeRADIUS + daloRADIUS installed successfully"
+msg_ok "FreeRADIUS installation complete"
 
 # -----------------------------------------------------------------------------
-# Final Info
+# Final message
 # -----------------------------------------------------------------------------
 IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}')
 
 echo
 echo "------------------------------------------------------------"
-echo " FreeRADIUS + daloRADIUS READY"
+echo " FreeRADIUS LXC is ready"
 echo "------------------------------------------------------------"
 echo " Container ID : $CTID"
 echo " Hostname     : freeradius"
 echo " IP Address   : $IP"
 echo
-echo " RADIUS Test:"
+echo " Test command:"
 echo "   radtest radusr radusr $IP 0 testing123"
-echo
-echo " daloRADIUS Web UI:"
-echo "   http://$IP/daloradius"
-echo "   Username: administrator"
-echo "   Password: radius"
 echo "------------------------------------------------------------"
