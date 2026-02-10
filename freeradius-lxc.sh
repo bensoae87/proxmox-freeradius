@@ -1,148 +1,69 @@
 #!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# FreeRADIUS LXC Installer for Proxmox
+# Uses the official Proxmox community-scripts build framework
+# -----------------------------------------------------------------------------
+
 set -e
 
-echo "=== Proxmox FreeRADIUS LXC Setup (Debian 12 Bookworm) ==="
+# Load community build functions (same as tasmoadmin.sh)
+source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 
-# ---- Safety Check ----
-if ! command -v pct >/dev/null; then
-  echo "❌ This script must be run on a Proxmox host"
-  exit 1
-fi
+# -----------------------------------------------------------------------------
+# App Metadata (used by the framework)
+# -----------------------------------------------------------------------------
+APP="FreeRADIUS"
+var_tags="radius;auth"
+var_cpu="2"
+var_ram="2048"
+var_disk="8"
+var_os="debian"
+var_version="12"
+var_unprivileged="1"
+var_hostname="freeradius"
 
-# ---- Defaults ----
-DEFAULT_CORES=2
-DEFAULT_RAM=2048
-DEFAULT_DISK=8
-DEFAULT_HOSTNAME="freeradius"
-DEFAULT_NET="dhcp"
-DEFAULT_BRIDGE="vmbr0"
-DEFAULT_CTID=$(pvesh get /cluster/nextid)
+# -----------------------------------------------------------------------------
+# Create the container
+# -----------------------------------------------------------------------------
+start
+build_container
 
-# ---- Confirmation ----
-read -rp "This will create a new LXC container. Continue? [y/N]: " CONFIRM
-[[ "$CONFIRM" =~ ^[Yy]$ ]] || exit 1
+# -----------------------------------------------------------------------------
+# Post-install configuration inside the container
+# -----------------------------------------------------------------------------
+msg_info "Installing FreeRADIUS 4"
 
-# ---- Prompts ----
-read -rp "Container ID [$DEFAULT_CTID]: " CTID
-CTID=${CTID:-$DEFAULT_CTID}
-
-read -rp "Hostname [$DEFAULT_HOSTNAME]: " HOSTNAME
-HOSTNAME=${HOSTNAME:-$DEFAULT_HOSTNAME}
-
-read -rp "CPU cores [$DEFAULT_CORES]: " CORES
-CORES=${CORES:-$DEFAULT_CORES}
-
-read -rp "RAM in MB [$DEFAULT_RAM]: " RAM
-RAM=${RAM:-$DEFAULT_RAM}
-
-read -rp "Disk size in GB [$DEFAULT_DISK]: " DISK
-DISK=${DISK:-$DEFAULT_DISK}
-
-read -rp "Network type (dhcp/static) [$DEFAULT_NET]: " NETTYPE
-NETTYPE=${NETTYPE:-$DEFAULT_NET}
-
-if [[ "$NETTYPE" == "static" ]]; then
-  read -rp "IP address (e.g. 192.168.1.50/24): " IPADDR
-  read -rp "Gateway (e.g. 192.168.1.1): " GATEWAY
-  NETCONF="name=eth0,bridge=$DEFAULT_BRIDGE,ip=$IPADDR,gw=$GATEWAY"
-else
-  NETCONF="name=eth0,bridge=$DEFAULT_BRIDGE,ip=dhcp"
-fi
-
-# ---- Storage Selection (Explicit, Proxmox 8 Safe) ----
-echo
-echo "Available storages that support LXC templates (vztmpl):"
-echo
-
-mapfile -t STORAGES < <(
-  pvesm status \
-    | awk 'NR>1 && $6 ~ /vztmpl/ {print $1}'
-)
-
-if [[ "${#STORAGES[@]}" -eq 0 ]]; then
-  echo "❌ No storage supports LXC templates (vztmpl)"
-  echo "Check with: pvesm status"
-  exit 1
-fi
-
-for i in "${!STORAGES[@]}"; do
-  printf "  [%d] %s\n" "$i" "${STORAGES[$i]}"
-done
-
-DEFAULT_STORAGE="${STORAGES[0]}"
-echo
-read -rp "Select storage [0] ($DEFAULT_STORAGE): " STORAGE_IDX
-STORAGE_IDX=${STORAGE_IDX:-0}
-STORAGE="${STORAGES[$STORAGE_IDX]}"
-
-echo "Using storage: $STORAGE"
-
-# ---- Find Latest Debian 12 Template ----
-echo
-echo "Looking up latest Debian 12 template..."
-pveam update
-
-TEMPLATE=$(pveam available --section system \
-  | awk '/debian-12-standard/ {print $2}' \
-  | sort -V \
-  | tail -n 1)
-
-if [[ -z "$TEMPLATE" ]]; then
-  echo "❌ Could not find Debian 12 template"
-  exit 1
-fi
-
-echo "Using template: $TEMPLATE"
-pveam download "$STORAGE" "$TEMPLATE"
-
-# ---- Create LXC ----
-echo
-echo "Creating container $CTID..."
-pct create "$CTID" "$STORAGE:vztmpl/$TEMPLATE" \
-  --hostname "$HOSTNAME" \
-  --cores "$CORES" \
-  --memory "$RAM" \
-  --rootfs ${STORAGE}:${DISK} \
-  --net0 "$NETCONF" \
-  --features keyctl=1,nesting=1 \
-  --unprivileged 1 \
-  --onboot 1
-
-# ---- Start Container ----
-pct start "$CTID"
-echo "Waiting for container to boot..."
-sleep 8
-
-# ---- Install FreeRADIUS ----
-echo "Installing FreeRADIUS 4..."
 pct exec "$CTID" -- bash -c "
 set -e
+
 apt update
 apt -y upgrade
 apt -y install freeradius freeradius-utils
-"
 
-# ---- Configure Default RADIUS User ----
-echo "Configuring default RADIUS user (radusr / radusr)..."
-pct exec "$CTID" -- bash -c "
+echo 'Adding default RADIUS user: radusr / radusr'
 cat <<EOF >> /etc/freeradius/4.0/mods-config/files/authorize
 radusr Cleartext-Password := \"radusr\"
 EOF
-"
 
-# ---- Enable & Restart ----
-pct exec "$CTID" -- bash -c "
 systemctl enable freeradius
 systemctl restart freeradius
 "
 
-# ---- Final Output ----
+msg_ok "FreeRADIUS installation complete"
+
+# -----------------------------------------------------------------------------
+# Final message
+# -----------------------------------------------------------------------------
+IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}')
+
 echo
-echo "=== Setup Complete ==="
-echo "Container ID : $CTID"
-echo "Hostname     : $HOSTNAME"
-echo "RADIUS User  : radusr"
-echo "Password    : radusr"
+echo "------------------------------------------------------------"
+echo " FreeRADIUS LXC is ready"
+echo "------------------------------------------------------------"
+echo " Container ID : $CTID"
+echo " Hostname     : freeradius"
+echo " IP Address   : $IP"
 echo
-echo "Test with:"
-echo "  pct exec $CTID -- radtest radusr radusr localhost 0 testing123"
+echo " Test command:"
+echo "   radtest radusr radusr $IP 0 testing123"
+echo "------------------------------------------------------------"
