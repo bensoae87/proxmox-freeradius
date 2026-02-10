@@ -1,154 +1,129 @@
 #!/usr/bin/env bash
-set -euo pipefail
+source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
 
-echo "=== Proxmox FreeRADIUS + daloRADIUS LXC (Debian 12) ==="
+header_info
+check_root
+check_pve
 
-# ---- Safety Check ----
-if ! command -v pct >/dev/null; then
-  echo "❌ This script must be run on a Proxmox host"
-  exit 1
-fi
+APP="FreeRADIUS + daloRADIUS"
+var_disk="8"
+var_cpu="2"
+var_ram="2048"
+var_os="debian"
+var_version="12"
+var_unprivileged="1"
+var_features="keyctl=1,nesting=1"
+var_tags="radius;network"
+var_hostname="freeradius"
 
-# ---- Defaults ----
-DEFAULT_CORES=2
-DEFAULT_RAM=2048
-DEFAULT_DISK=8
-DEFAULT_HOSTNAME="freeradius"
-DEFAULT_NET="dhcp"
-DEFAULT_BRIDGE="vmbr0"
-DEFAULT_CTID=$(pvesh get /cluster/nextid)
+default_settings
 
-# ---- Confirmation ----
-read -rp "This will create a new LXC container. Continue? [y/N]: " CONFIRM
-[[ "$CONFIRM" =~ ^[Yy]$ ]] || exit 1
+function update_container() {
+  msg_info "Updating container OS"
+  pct exec "$CTID" -- bash -c "apt update && apt -y upgrade"
+  msg_ok "OS updated"
+}
 
-# ---- Prompts ----
-read -rp "Container ID [$DEFAULT_CTID]: " CTID
-CTID=${CTID:-$DEFAULT_CTID}
+function install_packages() {
+  msg_info "Installing FreeRADIUS, Apache, PHP, MariaDB"
+  pct exec "$CTID" -- bash -c "
+    apt install -y \
+      freeradius freeradius-utils \
+      apache2 mariadb-server \
+      php php-cli php-common libapache2-mod-php \
+      php-mysql php-gd php-curl php-zip php-mbstring php-xml \
+      unzip git curl
+  "
+  msg_ok "Packages installed"
+}
 
-read -rp "Hostname [$DEFAULT_HOSTNAME]: " HOSTNAME
-HOSTNAME=${HOSTNAME:-$DEFAULT_HOSTNAME}
+function configure_apache_php() {
+  msg_info "Configuring Apache for PHP"
+  pct exec "$CTID" -- bash -c "
+    sed -i 's|DirectoryIndex .*|DirectoryIndex index.php index.html index.cgi index.pl index.xhtml index.htm|' /etc/apache2/mods-enabled/dir.conf
+    a2enmod php8.2
+    systemctl restart apache2
+  "
+  msg_ok "Apache configured"
+}
 
-read -rp "CPU cores [$DEFAULT_CORES]: " CORES
-CORES=${CORES:-$DEFAULT_CORES}
+function install_daloradius() {
+  msg_info "Installing daloRADIUS"
+  pct exec "$CTID" -- bash -c "
+    cd /var/www/html
+    git clone https://github.com/lirantal/daloradius.git
+    chown -R www-data:www-data daloradius
+    chmod -R 755 daloradius
+  "
+  msg_ok "daloRADIUS installed"
+}
 
-read -rp "RAM in MB [$DEFAULT_RAM]: " RAM
-RAM=${RAM:-$DEFAULT_RAM}
-
-read -rp "Disk size in GB [$DEFAULT_DISK]: " DISK
-DISK=${DISK:-$DEFAULT_DISK}
-
-read -rp "Network type (dhcp/static) [$DEFAULT_NET]: " NETTYPE
-NETTYPE=${NETTYPE:-$DEFAULT_NET}
-
-BRIDGE="$DEFAULT_BRIDGE"
-
-if [[ "$NETTYPE" == "static" ]]; then
-  read -rp "IP address (e.g. 192.168.1.50/24): " IPADDR
-  read -rp "Gateway (e.g. 192.168.1.1): " GATEWAY
-  NETCONF="name=eth0,bridge=$BRIDGE,ip=$IPADDR,gw=$GATEWAY"
-else
-  NETCONF="name=eth0,bridge=$BRIDGE,ip=dhcp"
-fi
-
-# ---- Detect Template Storage ----
-echo "Detecting storage that supports LXC templates..."
-STORAGE=$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 {print $1}' | head -n 1)
-
-if [[ -z "$STORAGE" ]]; then
-  echo "❌ No storage supports vztmpl"
-  exit 1
-fi
-
-echo "Using storage: $STORAGE"
-
-# ---- Debian Template ----
-pveam update
-TEMPLATE=$(pveam available --section system | awk '/debian-12-standard/ {print $2}' | sort -V | tail -n 1)
-pveam download "$STORAGE" "$TEMPLATE"
-
-# ---- Create LXC ----
-pct create "$CTID" "$STORAGE:vztmpl/$TEMPLATE" \
-  --hostname "$HOSTNAME" \
-  --cores "$CORES" \
-  --memory "$RAM" \
-  --rootfs ${STORAGE}:${DISK} \
-  --net0 "$NETCONF" \
-  --features keyctl=1,nesting=1 \
-  --unprivileged 1 \
-  --onboot 1
-
-pct start "$CTID"
-sleep 8
-
-# ---- Provision Inside Container ----
-pct exec "$CTID" -- bash -c "
-set -e
-
-echo 'Installing base packages...'
-apt update
-apt -y upgrade
-apt install -y \
-  freeradius freeradius-utils \
-  apache2 mariadb-server \
-  php php-cli php-common libapache2-mod-php \
-  php-mysql php-gd php-curl php-zip php-mbstring php-xml \
-  unzip git curl
-
-echo 'Fixing Apache DirectoryIndex...'
-sed -i 's|DirectoryIndex .*|DirectoryIndex index.php index.html index.cgi index.pl index.xhtml index.htm|' /etc/apache2/mods-enabled/dir.conf
-a2enmod php8.2
-systemctl restart apache2
-
-echo 'Installing daloRADIUS...'
-cd /var/www/html
-git clone https://github.com/lirantal/daloradius.git
-chown -R www-data:www-data daloradius
-chmod -R 755 daloradius
-
-echo 'Configuring MariaDB...'
-mysql -u root <<EOF
+function configure_database() {
+  msg_info "Configuring MariaDB for daloRADIUS"
+  pct exec "$CTID" -- bash -c "
+    mysql -u root <<EOF
 CREATE DATABASE radius;
 CREATE USER 'radius'@'localhost' IDENTIFIED BY 'radius';
 GRANT ALL PRIVILEGES ON radius.* TO 'radius'@'localhost';
 FLUSH PRIVILEGES;
 EOF
+    mysql -u radius -pradius radius < /var/www/html/daloradius/contrib/db/mysql-daloradius.sql
+    mysql -u radius -pradius radius < /var/www/html/daloradius/contrib/db/mysql-radius.sql
+  "
+  msg_ok "Database configured"
+}
 
-echo 'Importing daloRADIUS schema...'
-mysql -u radius -pradius radius < /var/www/html/daloradius/contrib/db/mysql-daloradius.sql
-mysql -u radius -pradius radius < /var/www/html/daloradius/contrib/db/mysql-radius.sql
+function configure_daloradius() {
+  msg_info "Configuring daloRADIUS"
+  pct exec "$CTID" -- bash -c "
+    cp /var/www/html/daloradius/library/daloradius.conf.php.sample \
+       /var/www/html/daloradius/library/daloradius.conf.php
 
-echo 'Configuring daloRADIUS...'
-cp /var/www/html/daloradius/library/daloradius.conf.php.sample \
-   /var/www/html/daloradius/library/daloradius.conf.php
+    sed -i \"s/DB_USER.*/DB_USER', 'radius');/\" /var/www/html/daloradius/library/daloradius.conf.php
+    sed -i \"s/DB_PASSWORD.*/DB_PASSWORD', 'radius');/\" /var/www/html/daloradius/library/daloradius.conf.php
+    sed -i \"s/DB_NAME.*/DB_NAME', 'radius');/\" /var/www/html/daloradius/library/daloradius.conf.php
+  "
+  msg_ok "daloRADIUS configured"
+}
 
-sed -i \"s/DB_USER.*/DB_USER', 'radius');/\" /var/www/html/daloradius/library/daloradius.conf.php
-sed -i \"s/DB_PASSWORD.*/DB_PASSWORD', 'radius');/\" /var/www/html/daloradius/library/daloradius.conf.php
-sed -i \"s/DB_NAME.*/DB_NAME', 'radius');/\" /var/www/html/daloradius/library/daloradius.conf.php
-
-echo 'Creating FreeRADIUS test user...'
+function configure_freeradius() {
+  msg_info "Configuring FreeRADIUS test user"
+  pct exec "$CTID" -- bash -c "
 cat <<EOF >> /etc/freeradius/4.0/mods-config/files/authorize
 radusr Cleartext-Password := \"radusr\"
 EOF
+    systemctl enable freeradius
+    systemctl restart freeradius
+  "
+  msg_ok "FreeRADIUS configured"
+}
 
-systemctl enable freeradius mariadb apache2
-systemctl restart freeradius mariadb apache2
-"
+function start_services() {
+  msg_info "Enabling services"
+  pct exec "$CTID" -- systemctl enable apache2 mariadb
+  pct exec "$CTID" -- systemctl restart apache2 mariadb
+  msg_ok "Services started"
+}
 
-# ---- Final Output ----
-echo
-echo "=== INSTALL COMPLETE ==="
-echo "Container ID : $CTID"
-echo "Hostname     : $HOSTNAME"
+start
+build_container
+update_container
+install_packages
+configure_apache_php
+install_daloradius
+configure_database
+configure_daloradius
+configure_freeradius
+start_services
+finish
+
+msg_ok "Installation complete!"
 echo
 echo "daloRADIUS UI:"
 echo "  http://<container-ip>/daloradius/"
 echo
-echo "daloRADIUS login:"
+echo "Login:"
 echo "  administrator / radius"
 echo
-echo "RADIUS test user:"
+echo "RADIUS test:"
 echo "  radusr / radusr"
-echo
-echo "Test RADIUS:"
-echo "  pct exec $CTID -- radtest radusr radusr localhost 0 testing123"
