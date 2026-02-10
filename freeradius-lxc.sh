@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Proxmox FreeRADIUS + daloRADIUS LXC Setup (Debian 12) ==="
+echo "=== Proxmox FreeRADIUS + daloRADIUS LXC (Debian 12) ==="
 
 # ---- Safety Check ----
 if ! command -v pct >/dev/null; then
@@ -51,12 +51,12 @@ else
   NETCONF="name=eth0,bridge=$BRIDGE,ip=dhcp"
 fi
 
-# ---- Detect Storage Supporting Templates ----
-echo "Detecting active storage that supports LXC templates..."
+# ---- Detect Template Storage ----
+echo "Detecting storage that supports LXC templates..."
 STORAGE=$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 {print $1}' | head -n 1)
 
 if [[ -z "$STORAGE" ]]; then
-  echo "❌ No active storage supports vztmpl"
+  echo "❌ No storage supports vztmpl"
   exit 1
 fi
 
@@ -90,13 +90,12 @@ apt update
 apt -y upgrade
 apt install -y \
   freeradius freeradius-utils \
-  apache2 \
-  mariadb-server \
+  apache2 mariadb-server \
   php php-cli php-common libapache2-mod-php \
   php-mysql php-gd php-curl php-zip php-mbstring php-xml \
   unzip git curl
 
-echo 'Fixing Apache PHP execution...'
+echo 'Fixing Apache DirectoryIndex...'
 sed -i 's|DirectoryIndex .*|DirectoryIndex index.php index.html index.cgi index.pl index.xhtml index.htm|' /etc/apache2/mods-enabled/dir.conf
 a2enmod php8.2
 systemctl restart apache2
@@ -107,7 +106,27 @@ git clone https://github.com/lirantal/daloradius.git
 chown -R www-data:www-data daloradius
 chmod -R 755 daloradius
 
-echo 'Creating test RADIUS user...'
+echo 'Configuring MariaDB...'
+mysql -u root <<EOF
+CREATE DATABASE radius;
+CREATE USER 'radius'@'localhost' IDENTIFIED BY 'radius';
+GRANT ALL PRIVILEGES ON radius.* TO 'radius'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+
+echo 'Importing daloRADIUS schema...'
+mysql -u radius -pradius radius < /var/www/html/daloradius/contrib/db/mysql-daloradius.sql
+mysql -u radius -pradius radius < /var/www/html/daloradius/contrib/db/mysql-radius.sql
+
+echo 'Configuring daloRADIUS...'
+cp /var/www/html/daloradius/library/daloradius.conf.php.sample \
+   /var/www/html/daloradius/library/daloradius.conf.php
+
+sed -i \"s/DB_USER.*/DB_USER', 'radius');/\" /var/www/html/daloradius/library/daloradius.conf.php
+sed -i \"s/DB_PASSWORD.*/DB_PASSWORD', 'radius');/\" /var/www/html/daloradius/library/daloradius.conf.php
+sed -i \"s/DB_NAME.*/DB_NAME', 'radius');/\" /var/www/html/daloradius/library/daloradius.conf.php
+
+echo 'Creating FreeRADIUS test user...'
 cat <<EOF >> /etc/freeradius/4.0/mods-config/files/authorize
 radusr Cleartext-Password := \"radusr\"
 EOF
@@ -122,12 +141,14 @@ echo "=== INSTALL COMPLETE ==="
 echo "Container ID : $CTID"
 echo "Hostname     : $HOSTNAME"
 echo
-echo "RADIUS test user:"
-echo "  Username: radusr"
-echo "  Password: radusr"
-echo
 echo "daloRADIUS UI:"
 echo "  http://<container-ip>/daloradius/"
+echo
+echo "daloRADIUS login:"
+echo "  administrator / radius"
+echo
+echo "RADIUS test user:"
+echo "  radusr / radusr"
 echo
 echo "Test RADIUS:"
 echo "  pct exec $CTID -- radtest radusr radusr localhost 0 testing123"
