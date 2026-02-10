@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -e
 
 echo "=== Proxmox FreeRADIUS LXC Setup (Debian 12 Bookworm) ==="
 
@@ -7,13 +7,6 @@ echo "=== Proxmox FreeRADIUS LXC Setup (Debian 12 Bookworm) ==="
 if ! command -v pct >/dev/null; then
   echo "❌ This script must be run on a Proxmox host"
   exit 1
-fi
-
-# ---- Ensure jq is available (Proxmox 8 may not ship it) ----
-if ! command -v jq >/dev/null; then
-  echo "jq not found — installing..."
-  apt update
-  apt install -y jq
 fi
 
 # ---- Defaults ----
@@ -48,32 +41,44 @@ DISK=${DISK:-$DEFAULT_DISK}
 read -rp "Network type (dhcp/static) [$DEFAULT_NET]: " NETTYPE
 NETTYPE=${NETTYPE:-$DEFAULT_NET}
 
-BRIDGE="$DEFAULT_BRIDGE"
-
 if [[ "$NETTYPE" == "static" ]]; then
   read -rp "IP address (e.g. 192.168.1.50/24): " IPADDR
   read -rp "Gateway (e.g. 192.168.1.1): " GATEWAY
-  NETCONF="name=eth0,bridge=$BRIDGE,ip=$IPADDR,gw=$GATEWAY"
+  NETCONF="name=eth0,bridge=$DEFAULT_BRIDGE,ip=$IPADDR,gw=$GATEWAY"
 else
-  NETCONF="name=eth0,bridge=$BRIDGE,ip=dhcp"
+  NETCONF="name=eth0,bridge=$DEFAULT_BRIDGE,ip=dhcp"
 fi
 
-# ---- Detect Active Storage Supporting LXC Templates ----
-echo "Detecting active storage that supports LXC templates (vztmpl)..."
+# ---- Storage Selection (Explicit, Proxmox 8 Safe) ----
+echo
+echo "Available storages that support LXC templates (vztmpl):"
+echo
 
-STORAGE=$(pvesh get /storage --output-format json \
-  | jq -r '.[] | select(.active==1) | select(.content[]?=="vztmpl") | .storage' \
-  | head -n 1)
+mapfile -t STORAGES < <(
+  pvesm status \
+    | awk 'NR>1 && $6 ~ /vztmpl/ {print $1}'
+)
 
-if [[ -z "$STORAGE" ]]; then
-  echo "❌ No ACTIVE storage found that supports LXC templates (vztmpl)"
-  echo "Check with: pvesh get /storage --output-format json | jq"
+if [[ "${#STORAGES[@]}" -eq 0 ]]; then
+  echo "❌ No storage supports LXC templates (vztmpl)"
+  echo "Check with: pvesm status"
   exit 1
 fi
+
+for i in "${!STORAGES[@]}"; do
+  printf "  [%d] %s\n" "$i" "${STORAGES[$i]}"
+done
+
+DEFAULT_STORAGE="${STORAGES[0]}"
+echo
+read -rp "Select storage [0] ($DEFAULT_STORAGE): " STORAGE_IDX
+STORAGE_IDX=${STORAGE_IDX:-0}
+STORAGE="${STORAGES[$STORAGE_IDX]}"
 
 echo "Using storage: $STORAGE"
 
 # ---- Find Latest Debian 12 Template ----
+echo
 echo "Looking up latest Debian 12 template..."
 pveam update
 
@@ -91,6 +96,7 @@ echo "Using template: $TEMPLATE"
 pveam download "$STORAGE" "$TEMPLATE"
 
 # ---- Create LXC ----
+echo
 echo "Creating container $CTID..."
 pct create "$CTID" "$STORAGE:vztmpl/$TEMPLATE" \
   --hostname "$HOSTNAME" \
