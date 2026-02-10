@@ -1,141 +1,133 @@
 #!/usr/bin/env bash
-# -----------------------------------------------------------------------------
-# FreeRADIUS + daloRADIUS Installer (Proxmox LXC Safe)
-# -----------------------------------------------------------------------------
+set -euo pipefail
 
+echo "=== Proxmox FreeRADIUS + daloRADIUS LXC Setup (Debian 12) ==="
+
+# ---- Safety Check ----
+if ! command -v pct >/dev/null; then
+  echo "❌ This script must be run on a Proxmox host"
+  exit 1
+fi
+
+# ---- Defaults ----
+DEFAULT_CORES=2
+DEFAULT_RAM=2048
+DEFAULT_DISK=8
+DEFAULT_HOSTNAME="freeradius"
+DEFAULT_NET="dhcp"
+DEFAULT_BRIDGE="vmbr0"
+DEFAULT_CTID=$(pvesh get /cluster/nextid)
+
+# ---- Confirmation ----
+read -rp "This will create a new LXC container. Continue? [y/N]: " CONFIRM
+[[ "$CONFIRM" =~ ^[Yy]$ ]] || exit 1
+
+# ---- Prompts ----
+read -rp "Container ID [$DEFAULT_CTID]: " CTID
+CTID=${CTID:-$DEFAULT_CTID}
+
+read -rp "Hostname [$DEFAULT_HOSTNAME]: " HOSTNAME
+HOSTNAME=${HOSTNAME:-$DEFAULT_HOSTNAME}
+
+read -rp "CPU cores [$DEFAULT_CORES]: " CORES
+CORES=${CORES:-$DEFAULT_CORES}
+
+read -rp "RAM in MB [$DEFAULT_RAM]: " RAM
+RAM=${RAM:-$DEFAULT_RAM}
+
+read -rp "Disk size in GB [$DEFAULT_DISK]: " DISK
+DISK=${DISK:-$DEFAULT_DISK}
+
+read -rp "Network type (dhcp/static) [$DEFAULT_NET]: " NETTYPE
+NETTYPE=${NETTYPE:-$DEFAULT_NET}
+
+BRIDGE="$DEFAULT_BRIDGE"
+
+if [[ "$NETTYPE" == "static" ]]; then
+  read -rp "IP address (e.g. 192.168.1.50/24): " IPADDR
+  read -rp "Gateway (e.g. 192.168.1.1): " GATEWAY
+  NETCONF="name=eth0,bridge=$BRIDGE,ip=$IPADDR,gw=$GATEWAY"
+else
+  NETCONF="name=eth0,bridge=$BRIDGE,ip=dhcp"
+fi
+
+# ---- Detect Storage Supporting Templates ----
+echo "Detecting active storage that supports LXC templates..."
+STORAGE=$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 {print $1}' | head -n 1)
+
+if [[ -z "$STORAGE" ]]; then
+  echo "❌ No active storage supports vztmpl"
+  exit 1
+fi
+
+echo "Using storage: $STORAGE"
+
+# ---- Debian Template ----
+pveam update
+TEMPLATE=$(pveam available --section system | awk '/debian-12-standard/ {print $2}' | sort -V | tail -n 1)
+pveam download "$STORAGE" "$TEMPLATE"
+
+# ---- Create LXC ----
+pct create "$CTID" "$STORAGE:vztmpl/$TEMPLATE" \
+  --hostname "$HOSTNAME" \
+  --cores "$CORES" \
+  --memory "$RAM" \
+  --rootfs ${STORAGE}:${DISK} \
+  --net0 "$NETCONF" \
+  --features keyctl=1,nesting=1 \
+  --unprivileged 1 \
+  --onboot 1
+
+pct start "$CTID"
+sleep 8
+
+# ---- Provision Inside Container ----
+pct exec "$CTID" -- bash -c "
 set -e
 
-# Load Proxmox community build framework
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)
-
-# -----------------------------------------------------------------------------
-# App Metadata / Defaults
-# -----------------------------------------------------------------------------
-APP="FreeRADIUS + daloRADIUS"
-var_tags="radius;daloradius"
-var_cpu="2"
-var_ram="2048"
-var_disk="8"
-var_os="debian"
-var_version="12"
-var_unprivileged="0"          # REQUIRED for FreeRADIUS
-var_hostname="freeradius"     # ✅ DEFAULT HOSTNAME
-
-# -----------------------------------------------------------------------------
-# Build the container
-# -----------------------------------------------------------------------------
-start
-build_container
-
-# -----------------------------------------------------------------------------
-# Install base packages
-# -----------------------------------------------------------------------------
-msg_info "Installing FreeRADIUS, MariaDB, Apache, PHP"
-
-pct exec "$CTID" -- bash -c "
-export DEBIAN_FRONTEND=noninteractive
-
+echo 'Installing base packages...'
 apt update
 apt -y upgrade
-apt -y install freeradius freeradius-utils mariadb-server \
-               apache2 php php-mysql php-gd php-curl php-zip \
-               php-mbstring php-xml git unzip
-"
+apt install -y \
+  freeradius freeradius-utils \
+  apache2 \
+  mariadb-server \
+  php php-cli php-common libapache2-mod-php \
+  php-mysql php-gd php-curl php-zip php-mbstring php-xml \
+  unzip git curl
 
-# -----------------------------------------------------------------------------
-# Systemd overrides for LXC compatibility
-# -----------------------------------------------------------------------------
-msg_info "Applying systemd overrides for LXC compatibility"
+echo 'Fixing Apache PHP execution...'
+sed -i 's|DirectoryIndex .*|DirectoryIndex index.php index.html index.cgi index.pl index.xhtml index.htm|' /etc/apache2/mods-enabled/dir.conf
+a2enmod php8.2
+systemctl restart apache2
 
-pct exec "$CTID" -- bash -c "
-set -e
+echo 'Installing daloRADIUS...'
+cd /var/www/html
+git clone https://github.com/lirantal/daloradius.git
+chown -R www-data:www-data daloradius
+chmod -R 755 daloradius
 
-for svc in freeradius mariadb apache2; do
-  mkdir -p /etc/systemd/system/\$svc.service.d
-  cat <<EOF > /etc/systemd/system/\$svc.service.d/override.conf
-[Service]
-PrivateTmp=no
-ProtectSystem=off
-ProtectHome=off
-NoNewPrivileges=no
-RestrictNamespaces=no
-EOF
-done
-
-systemctl daemon-reexec
-systemctl daemon-reload
-"
-
-# -----------------------------------------------------------------------------
-# Start services
-# -----------------------------------------------------------------------------
-msg_info "Starting services"
-
-pct exec "$CTID" -- bash -c "
-systemctl enable mariadb apache2 freeradius
-systemctl start mariadb apache2 freeradius
-"
-
-# -----------------------------------------------------------------------------
-# Configure FreeRADIUS test user
-# -----------------------------------------------------------------------------
-msg_info "Configuring FreeRADIUS test user"
-
-pct exec "$CTID" -- bash -c "
-cat <<EOF >> /etc/freeradius/3.0/mods-config/files/authorize
+echo 'Creating test RADIUS user...'
+cat <<EOF >> /etc/freeradius/4.0/mods-config/files/authorize
 radusr Cleartext-Password := \"radusr\"
 EOF
 
-systemctl restart freeradius
+systemctl enable freeradius mariadb apache2
+systemctl restart freeradius mariadb apache2
 "
 
-# -----------------------------------------------------------------------------
-# Configure MariaDB and daloRADIUS
-# -----------------------------------------------------------------------------
-msg_info "Installing and configuring daloRADIUS"
-
-pct exec "$CTID" -- bash -c "
-mysql -e \"CREATE DATABASE IF NOT EXISTS radius;\"
-mysql -e \"CREATE USER IF NOT EXISTS 'radius'@'localhost' IDENTIFIED BY 'radius';\"
-mysql -e \"GRANT ALL PRIVILEGES ON radius.* TO 'radius'@'localhost';\"
-mysql -e \"FLUSH PRIVILEGES;\"
-
-cd /var/www/html
-git clone https://github.com/lirantal/daloradius.git || true
-chown -R www-data:www-data daloradius
-
-mysql radius < daloradius/contrib/db/fr2-mysql-daloradius-and-freeradius.sql
-
-cp daloradius/library/daloradius.conf.php.sample \
-   daloradius/library/daloradius.conf.php
-
-sed -i \"s/DB_USER.*/DB_USER = 'radius';/\" daloradius/library/daloradius.conf.php
-sed -i \"s/DB_PASSWORD.*/DB_PASSWORD = 'radius';/\" daloradius/library/daloradius.conf.php
-sed -i \"s/DB_NAME.*/DB_NAME = 'radius';/\" daloradius/library/daloradius.conf.php
-
-systemctl restart apache2
-"
-
-# -----------------------------------------------------------------------------
-# Final Output
-# -----------------------------------------------------------------------------
-msg_ok "FreeRADIUS + daloRADIUS installation complete"
-
-IP=$(pct exec "$CTID" -- hostname -I | awk '{print $1}')
-
+# ---- Final Output ----
 echo
-echo "------------------------------------------------------------"
-echo " FreeRADIUS + daloRADIUS READY"
-echo "------------------------------------------------------------"
-echo " Hostname     : freeradius"
-echo " Container ID : $CTID"
-echo " IP Address   : $IP"
+echo "=== INSTALL COMPLETE ==="
+echo "Container ID : $CTID"
+echo "Hostname     : $HOSTNAME"
 echo
-echo " RADIUS Test:"
-echo "   radtest radusr radusr $IP 0 testing123"
+echo "RADIUS test user:"
+echo "  Username: radusr"
+echo "  Password: radusr"
 echo
-echo " daloRADIUS UI:"
-echo "   http://$IP/daloradius"
-echo "   Username: administrator"
-echo "   Password: radius"
-echo "------------------------------------------------------------"
+echo "daloRADIUS UI:"
+echo "  http://<container-ip>/daloradius/"
+echo
+echo "Test RADIUS:"
+echo "  pct exec $CTID -- radtest radusr radusr localhost 0 testing123"
