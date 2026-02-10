@@ -51,14 +51,16 @@ else
   NETCONF="name=eth0,bridge=$BRIDGE,ip=dhcp"
 fi
 
-# ---- Detect Storage That Actually Supports Templates ----
+# ---- Detect Active Template-Capable Storage (Proxmox 8 Safe) ----
 echo "Detecting active storage that supports LXC templates (vztmpl)..."
 
-STORAGE=$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 {print $1}' | head -n 1)
+STORAGE=$(pvesh get /storage --output-format json \
+  | jq -r '.[] | select(.active==1) | select(.content[]?=="vztmpl") | .storage' \
+  | head -n 1)
 
 if [[ -z "$STORAGE" ]]; then
-  echo "❌ No active storage found that supports LXC templates (vztmpl)"
-  echo "Check with: pvesm status"
+  echo "❌ No ACTIVE storage found that supports LXC templates (vztmpl)"
+  echo "Check with: pvesh get /storage --output-format json | jq"
   exit 1
 fi
 
